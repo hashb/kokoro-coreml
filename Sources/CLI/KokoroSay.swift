@@ -435,16 +435,23 @@ struct Say: AsyncParsableCommand {
             }
         }
 
+        let duration = Double(totalFrames) / KokoroEngine.audioFormat.sampleRate
+        let elapsed = CFAbsoluteTimeGetCurrent() - t0
+        let synthMs = Int(elapsed * 1000)
+        let durStr = String(format: "%.1f", duration)
+
+        guard reportedFirst else {
+            closePrinter()
+            print("[\(voice)] \(chunks) chunks, \(durStr)s audio, \(synthMs)ms total synth")
+            return
+        }
+
         let sentinel = AVAudioPCMBuffer(pcmFormat: KokoroEngine.audioFormat, frameCapacity: 1)!
         sentinel.frameLength = 1
         sentinel.floatChannelData?[0].pointee = 0
         await player.scheduleBuffer(sentinel)
         closePrinter()
 
-        let duration = Double(totalFrames) / KokoroEngine.audioFormat.sampleRate
-        let elapsed = CFAbsoluteTimeGetCurrent() - t0
-        let synthMs = Int(elapsed * 1000)
-        let durStr = String(format: "%.1f", duration)
         print("[\(voice)] \(chunks) chunks, \(durStr)s audio, \(synthMs)ms total synth")
         try await Task.sleep(for: .milliseconds(100))
     }
