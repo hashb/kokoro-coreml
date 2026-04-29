@@ -683,9 +683,9 @@ public final class KokoroEngine: @unchecked Sendable {
 
         for token in tokens {
             if !current.isEmpty {
-                let candidate = current + [token]
-                let candidateCount = encodedCount(
-                    forTimestampTokens: candidate, tokenizer: tokenizer)
+                current.append(token)
+                let candidateCount = encodedCount(forTimestampTokens: current, tokenizer: tokenizer)
+                current.removeLast()
                 if candidateCount > maxPhonemes {
                     let split = waterfallSplitIndex(
                         in: current, candidateCount: candidateCount,

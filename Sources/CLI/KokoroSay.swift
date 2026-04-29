@@ -295,62 +295,16 @@ struct Say: AsyncParsableCommand {
             throw ExitCode.failure
         }
 
+        let printer = LiveTextPrinter(player: player)
+        printer.append(timestamps)
         let done = DispatchSemaphore(value: 0)
         player.scheduleBuffer(buf) { done.signal() }
-
-        fputs("Text: ", stdout)
-        fflush(stdout)
-
-        var index = 0
-        var printedAny = false
-        var playbackDone = false
-        let fallbackStart = CFAbsoluteTimeGetCurrent()
+        printer.start()
         player.play()
-
-        while !playbackDone && index < timestamps.count {
-            let currentTime = playbackTime(for: player, fallbackStart: fallbackStart)
-            while index < timestamps.count && timestamps[index].startTime <= currentTime + 0.02 {
-                printLiveToken(timestamps[index].text, printedAny: printedAny)
-                printedAny = true
-                index += 1
-            }
-
-            if done.wait(timeout: .now() + .milliseconds(10)) == .success {
-                playbackDone = true
-            }
-        }
-
-        while index < timestamps.count {
-            printLiveToken(timestamps[index].text, printedAny: printedAny)
-            printedAny = true
-            index += 1
-        }
-
-        if !playbackDone { done.wait() }
-        if printedAny { fputs("\n", stdout) }
+        done.wait()
+        printer.finish()
+        printer.wait()
         Thread.sleep(forTimeInterval: 0.1)
-    }
-
-    private func playbackTime(
-        for player: AVAudioPlayerNode,
-        fallbackStart: CFAbsoluteTime
-    ) -> TimeInterval {
-        if let nodeTime = player.lastRenderTime,
-            let playerTime = player.playerTime(forNodeTime: nodeTime),
-            playerTime.sampleRate > 0
-        {
-            return Double(playerTime.sampleTime) / playerTime.sampleRate
-        }
-        return CFAbsoluteTimeGetCurrent() - fallbackStart
-    }
-
-    private func printLiveToken(_ text: String, printedAny: Bool) {
-        let attachesToPrevious = text.first.map { ",.;:!?)]}\u{201D}".contains($0) } ?? false
-        if printedAny && !attachesToPrevious {
-            fputs(" ", stdout)
-        }
-        fputs(text, stdout)
-        fflush(stdout)
     }
 
     // MARK: - Streaming
@@ -386,10 +340,7 @@ struct Say: AsyncParsableCommand {
         let durStr = String(format: "%.1f", duration)
         print("[\(voice)] \(chunks) chunks, \(durStr)s audio, \(synthMs)ms total synth")
 
-        let sentinel = AVAudioPCMBuffer(pcmFormat: KokoroEngine.audioFormat, frameCapacity: 1)!
-        sentinel.frameLength = 1
-        sentinel.floatChannelData?[0].pointee = 0
-        await player.scheduleBuffer(sentinel)
+        await player.scheduleBuffer(makeSentinelBuffer())
         try await Task.sleep(for: .milliseconds(100))
     }
 
@@ -406,15 +357,7 @@ struct Say: AsyncParsableCommand {
         var chunks = 0
         var totalFrames: AVAudioFrameCount = 0
         var reportedFirst = false
-        var printerClosed = false
-
-        func closePrinter() {
-            guard !printerClosed else { return }
-            printer.finish()
-            printer.wait()
-            printerClosed = true
-        }
-        defer { closePrinter() }
+        defer { printer.finish(); printer.wait() }
 
         for await event in try engine.speakWithTimestamps(text, voice: voice, speed: speed) {
             switch event {
@@ -441,16 +384,13 @@ struct Say: AsyncParsableCommand {
         let durStr = String(format: "%.1f", duration)
 
         guard reportedFirst else {
-            closePrinter()
             print("[\(voice)] \(chunks) chunks, \(durStr)s audio, \(synthMs)ms total synth")
             return
         }
 
-        let sentinel = AVAudioPCMBuffer(pcmFormat: KokoroEngine.audioFormat, frameCapacity: 1)!
-        sentinel.frameLength = 1
-        sentinel.floatChannelData?[0].pointee = 0
-        await player.scheduleBuffer(sentinel)
-        closePrinter()
+        await player.scheduleBuffer(makeSentinelBuffer())
+        printer.finish()
+        printer.wait()
 
         print("[\(voice)] \(chunks) chunks, \(durStr)s audio, \(synthMs)ms total synth")
         try await Task.sleep(for: .milliseconds(100))
@@ -487,6 +427,7 @@ private final class LiveTextPrinter: @unchecked Sendable {
     private var nextIndex = 0
     private var finished = false
     private var started = false
+    private var waited = false
     private var fallbackStart: CFAbsoluteTime = 0
 
     init(player: AVAudioPlayerNode) {
@@ -516,6 +457,7 @@ private final class LiveTextPrinter: @unchecked Sendable {
 
     func finish() {
         lock.lock()
+        guard !finished else { lock.unlock(); return }
         finished = true
         let shouldSignal = !started
         lock.unlock()
@@ -523,6 +465,10 @@ private final class LiveTextPrinter: @unchecked Sendable {
     }
 
     func wait() {
+        lock.lock()
+        guard !waited else { lock.unlock(); return }
+        waited = true
+        lock.unlock()
         done.wait()
     }
 
@@ -534,10 +480,10 @@ private final class LiveTextPrinter: @unchecked Sendable {
 
         var printedAny = false
         while true {
-            let currentTime = playbackTime()
+            let currentTime = playerPlaybackTime(player, fallbackStart: fallbackStart)
             let due = dueTokens(at: currentTime + 0.02)
             for token in due {
-                printToken(token.text, printedAny: printedAny)
+                printTokenToStdout(token.text, printedAny: printedAny)
                 printedAny = true
             }
 
@@ -569,24 +515,35 @@ private final class LiveTextPrinter: @unchecked Sendable {
         return due
     }
 
-    private func playbackTime() -> TimeInterval {
-        if let nodeTime = player.lastRenderTime,
-            let playerTime = player.playerTime(forNodeTime: nodeTime),
-            playerTime.sampleRate > 0
-        {
-            return Double(playerTime.sampleTime) / playerTime.sampleRate
-        }
-        return CFAbsoluteTimeGetCurrent() - fallbackStart
-    }
+}
 
-    private func printToken(_ text: String, printedAny: Bool) {
-        let attachesToPrevious = text.first.map { ",.;:!?)]}\u{201D}".contains($0) } ?? false
-        if printedAny && !attachesToPrevious {
-            fputs(" ", stdout)
-        }
-        fputs(text, stdout)
-        fflush(stdout)
+private let attachingPunct = ",.;:!?)]}\u{201D}"
+
+private func printTokenToStdout(_ text: String, printedAny: Bool) {
+    if printedAny && !(text.first.map { attachingPunct.contains($0) } ?? false) {
+        fputs(" ", stdout)
     }
+    fputs(text, stdout)
+    fflush(stdout)
+}
+
+private func playerPlaybackTime(_ player: AVAudioPlayerNode, fallbackStart: CFAbsoluteTime)
+    -> TimeInterval
+{
+    if let nodeTime = player.lastRenderTime,
+        let playerTime = player.playerTime(forNodeTime: nodeTime),
+        playerTime.sampleRate > 0
+    {
+        return Double(playerTime.sampleTime) / playerTime.sampleRate
+    }
+    return CFAbsoluteTimeGetCurrent() - fallbackStart
+}
+
+private func makeSentinelBuffer() -> AVAudioPCMBuffer {
+    let buf = AVAudioPCMBuffer(pcmFormat: KokoroEngine.audioFormat, frameCapacity: 1)!
+    buf.frameLength = 1
+    buf.floatChannelData?[0].pointee = 0
+    return buf
 }
 
 // MARK: - Update
