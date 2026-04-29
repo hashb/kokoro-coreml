@@ -96,14 +96,15 @@ let result = try engine.synthesize(ipa: "hˈɛloʊ wˈɜːld", voice: "af_heart"
 kokoro say "hello from the terminal"
 kokoro say -v am_adam -s 1.3 "speed it up"
 kokoro say --stream "start hearing audio before synthesis finishes"
-kokoro say --show-text "show token timestamps"
+kokoro say --show-text "show text during playback"
+kokoro say --stream --show-text "stream audio with live text"
 kokoro say -o output.wav "save to file"
 echo "long article" | kokoro say --stream
 kokoro say --list-voices
 kokoro daemon start   # keep models loaded, 3x faster repeat synthesis
 ```
 
-`--stream` starts playback as soon as the first chunk is ready. `--ipa` accepts IPA phonemes directly. `--show-text` prints text tokens in sync with playback for regular `say` synthesis.
+`--stream` starts playback as soon as the first chunk is ready. `--ipa` accepts IPA phonemes directly. `--show-text` prints text tokens in sync with playback.
 
 ## performance
 

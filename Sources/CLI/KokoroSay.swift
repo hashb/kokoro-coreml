@@ -64,9 +64,6 @@ struct Say: AsyncParsableCommand {
         if stream && output != nil {
             throw ValidationError("--stream and --output cannot be used together")
         }
-        if showText && stream {
-            throw ValidationError("--show-text cannot be used with --stream")
-        }
         if showText && ipa {
             throw ValidationError("--show-text cannot be used with --ipa")
         }
@@ -201,7 +198,11 @@ struct Say: AsyncParsableCommand {
             throw ExitCode.failure
         }
 
-        try await streamPlayback(engine: engine, text: inputText, voice: voice)
+        if showText {
+            try await streamPlaybackWithText(engine: engine, text: inputText, voice: voice)
+        } else {
+            try await streamPlayback(engine: engine, text: inputText, voice: voice)
+        }
     }
 
     // MARK: - Input
@@ -389,6 +390,62 @@ struct Say: AsyncParsableCommand {
         try await Task.sleep(for: .milliseconds(100))
     }
 
+    private func streamPlaybackWithText(
+        engine: KokoroEngine,
+        text: String,
+        voice: String
+    ) async throws {
+        let (audioEngine, player) = try startAudioPlayer(autoplay: false)
+        defer { audioEngine.stop() }
+
+        let printer = LiveTextPrinter(player: player)
+        let t0 = CFAbsoluteTimeGetCurrent()
+        var chunks = 0
+        var totalFrames: AVAudioFrameCount = 0
+        var reportedFirst = false
+        var printerClosed = false
+
+        func closePrinter() {
+            guard !printerClosed else { return }
+            printer.finish()
+            printer.wait()
+            printerClosed = true
+        }
+        defer { closePrinter() }
+
+        for await event in try engine.speakWithTimestamps(text, voice: voice, speed: speed) {
+            switch event {
+            case .audio(let buffer, let timestamps):
+                chunks += 1
+                totalFrames += buffer.frameLength
+                printer.append(timestamps)
+                player.scheduleBuffer(buffer, completionHandler: nil)
+                if !reportedFirst {
+                    reportedFirst = true
+                    let latency = CFAbsoluteTimeGetCurrent() - t0
+                    print("[\(voice)] first audio in \(Int(latency * 1000))ms")
+                    printer.start()
+                    player.play()
+                }
+            case .chunkFailed(let error):
+                fputs("[\(voice)] chunk failed: \(error.localizedDescription)\n", stderr)
+            }
+        }
+
+        let sentinel = AVAudioPCMBuffer(pcmFormat: KokoroEngine.audioFormat, frameCapacity: 1)!
+        sentinel.frameLength = 1
+        sentinel.floatChannelData?[0].pointee = 0
+        await player.scheduleBuffer(sentinel)
+        closePrinter()
+
+        let duration = Double(totalFrames) / KokoroEngine.audioFormat.sampleRate
+        let elapsed = CFAbsoluteTimeGetCurrent() - t0
+        let synthMs = Int(elapsed * 1000)
+        let durStr = String(format: "%.1f", duration)
+        print("[\(voice)] \(chunks) chunks, \(durStr)s audio, \(synthMs)ms total synth")
+        try await Task.sleep(for: .milliseconds(100))
+    }
+
     // MARK: - Debug
 
     private func printDebugInfo(result: SynthesisResult) {
@@ -410,6 +467,116 @@ struct Say: AsyncParsableCommand {
         print(String(format: "  Total samples: %d (%.1fs)", result.samples.count, result.duration))
     }
 
+}
+
+private final class LiveTextPrinter: @unchecked Sendable {
+    private let player: AVAudioPlayerNode
+    private let lock = NSLock()
+    private let done = DispatchSemaphore(value: 0)
+    private var timestamps: [SynthesisTimestamp] = []
+    private var nextIndex = 0
+    private var finished = false
+    private var started = false
+    private var fallbackStart: CFAbsoluteTime = 0
+
+    init(player: AVAudioPlayerNode) {
+        self.player = player
+    }
+
+    func append(_ newTimestamps: [SynthesisTimestamp]) {
+        lock.lock()
+        timestamps.append(contentsOf: newTimestamps)
+        lock.unlock()
+    }
+
+    func start() {
+        lock.lock()
+        guard !started else {
+            lock.unlock()
+            return
+        }
+        started = true
+        fallbackStart = CFAbsoluteTimeGetCurrent()
+        lock.unlock()
+
+        let thread = Thread { self.run() }
+        thread.stackSize = 512 * 1024
+        thread.start()
+    }
+
+    func finish() {
+        lock.lock()
+        finished = true
+        let shouldSignal = !started
+        lock.unlock()
+        if shouldSignal { done.signal() }
+    }
+
+    func wait() {
+        done.wait()
+    }
+
+    private func run() {
+        defer { done.signal() }
+
+        fputs("Text: ", stdout)
+        fflush(stdout)
+
+        var printedAny = false
+        while true {
+            let currentTime = playbackTime()
+            let due = dueTokens(at: currentTime + 0.02)
+            for token in due {
+                printToken(token.text, printedAny: printedAny)
+                printedAny = true
+            }
+
+            lock.lock()
+            let shouldExit = finished && nextIndex >= timestamps.count
+            lock.unlock()
+            if shouldExit { break }
+
+            Thread.sleep(forTimeInterval: 0.01)
+        }
+
+        if printedAny {
+            fputs("\n", stdout)
+        } else {
+            fputs("(none)\n", stdout)
+        }
+        fflush(stdout)
+    }
+
+    private func dueTokens(at currentTime: TimeInterval) -> [SynthesisTimestamp] {
+        lock.lock()
+        defer { lock.unlock() }
+
+        var due: [SynthesisTimestamp] = []
+        while nextIndex < timestamps.count && timestamps[nextIndex].startTime <= currentTime {
+            due.append(timestamps[nextIndex])
+            nextIndex += 1
+        }
+        return due
+    }
+
+    private func playbackTime() -> TimeInterval {
+        if let nodeTime = player.lastRenderTime,
+            let playerTime = player.playerTime(forNodeTime: nodeTime),
+            playerTime.sampleRate > 0
+        {
+            return Double(playerTime.sampleTime) / playerTime.sampleRate
+        }
+        return CFAbsoluteTimeGetCurrent() - fallbackStart
+    }
+
+    private func printToken(_ text: String, printedAny: Bool) {
+        let attachesToPrevious = text.first.map { ",.;:!?)]}\u{201D}".contains($0) } ?? false
+        if printedAny && !attachesToPrevious {
+            fputs(" ", stdout)
+        }
+        fputs(text, stdout)
+        fflush(stdout)
+    }
 }
 
 // MARK: - Update

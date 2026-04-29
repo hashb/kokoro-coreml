@@ -1109,6 +1109,63 @@ public final class KokoroEngine: @unchecked Sendable {
         }
     }
 
+    /// Stream synthesized audio with text-token timestamps on the stream timeline.
+    public func speakWithTimestamps(
+        _ text: String,
+        voice: String,
+        speed: Float = 1.0
+    ) throws -> AsyncStream<TimedSpeakEvent> {
+        guard availableVoices.contains(voice) else {
+            throw KokoroError.voiceNotFound(voice)
+        }
+
+        let clampedSpeed = Self.clampSpeed(speed)
+        let prepared = prepareChunks(text: text)
+        guard !prepared.chunks.isEmpty else { return AsyncStream { $0.finish() } }
+
+        return AsyncStream { continuation in
+            let thread = Thread {
+                let format = Self.audioFormat
+                var audioOffset: TimeInterval = 0
+
+                for chunk in prepared.chunks {
+                    if Thread.current.isCancelled { break }
+
+                    do {
+                        let styleVector = try self.voiceStore.embedding(
+                            for: voice, tokenCount: chunk.tokenIds.count - 2)
+
+                        var (samples, durations) = try self.synthesizeChunk(
+                            tokenIds: chunk.tokenIds, styleVector: styleVector,
+                            speed: clampedSpeed)
+                        Self.applyFades(&samples)
+                        Self.postProcess(&samples)
+
+                        if let buffer = Self.makePCMBuffer(from: samples, format: format) {
+                            let tokenTimestamps = chunk.timestampTokens.map {
+                                self.timestamps(
+                                    for: $0, durations: durations,
+                                    audioOffset: audioOffset, sampleCount: samples.count)
+                            } ?? []
+                            audioOffset += Double(buffer.frameLength) / format.sampleRate
+                            continuation.yield(.audio(buffer, timestamps: tokenTimestamps))
+                        }
+                    } catch {
+                        Self.logger.error(
+                            "Streaming chunk failed: \(error.localizedDescription)")
+                        continuation.yield(.chunkFailed(error))
+                    }
+                }
+
+                continuation.finish()
+            }
+            thread.stackSize = 8 * 1024 * 1024
+            nonisolated(unsafe) let unsafeThread = thread
+            continuation.onTermination = { _ in unsafeThread.cancel() }
+            thread.start()
+        }
+    }
+
     /// Stream synthesized audio using a raw 256-dim style vector.
     public func speak(
         _ text: String,
@@ -1182,6 +1239,14 @@ public enum SpeakEvent: @unchecked Sendable {
     case chunkFailed(any Error)
 }
 
+/// Events yielded by ``KokoroEngine/speakWithTimestamps(_:voice:speed:)``.
+public enum TimedSpeakEvent: @unchecked Sendable {
+    /// A playback-ready audio buffer and text-token timestamps on the stream timeline.
+    case audio(AVAudioPCMBuffer, timestamps: [SynthesisTimestamp])
+    /// A chunk failed to synthesize. The stream continues with remaining chunks.
+    case chunkFailed(any Error)
+}
+
 // MARK: - SynthesisResult
 
 /// Timestamp for a synthesized text token.
@@ -1192,10 +1257,10 @@ public struct SynthesisTimestamp: Sendable, Equatable {
     /// IPA phonemes used to synthesize this token.
     public let phonemes: String
 
-    /// Start time in seconds, relative to ``SynthesisResult/samples``.
+    /// Start time in seconds, relative to the containing result or stream.
     public let startTime: TimeInterval
 
-    /// End time in seconds, relative to ``SynthesisResult/samples``.
+    /// End time in seconds, relative to the containing result or stream.
     public let endTime: TimeInterval
 
     /// Token duration in seconds.
