@@ -836,6 +836,11 @@ public final class KokoroEngine: @unchecked Sendable {
         }
 
         var results: [SynthesisTimestamp] = []
+        // Duration entries are model frames, while the alignment walk below
+        // uses half-frame units. The first duration belongs to the leading
+        // BOS/silence region; backing it off by three frames matches the trim
+        // applied to generated audio and keeps the first spoken token from
+        // starting late when the model predicts a long leading duration.
         var left = 2 * max(0, (durations.first ?? 0) - 3)
         var right = left
         var index = 1
