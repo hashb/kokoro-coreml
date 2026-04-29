@@ -53,6 +53,7 @@ async streaming. audio chunks arrive as they're synthesized. playback starts imm
 let engine = try KokoroEngine()
 let result = try engine.synthesize(text: "hello world", voice: "af_heart")
 // result.samples → 24kHz mono PCM float array
+// result.timestamps → text-token timings in seconds
 // result.duration → audio length in seconds
 // result.realTimeFactor → how much faster than real-time
 ```

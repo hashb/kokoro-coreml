@@ -104,6 +104,28 @@ public final class KokoroEngine: @unchecked Sendable {
     private let _loadCondition = NSCondition()
     private let _isReady = OSAllocatedUnfairLock(initialState: false)
 
+    private struct PreparedSynthesis: Sendable {
+        let phonemes: String
+        let chunks: [PreparedChunk]
+    }
+
+    private struct PreparedChunk: Sendable {
+        let tokenIds: [Int]
+        let timestampTokens: [TimestampToken]?
+    }
+
+    private struct TimestampToken: Sendable {
+        let text: String
+        let phonemes: String
+        var whitespace: String
+
+        init(_ token: MToken) {
+            self.text = token.text
+            self.phonemes = token.phonemes ?? ""
+            self.whitespace = token.whitespace
+        }
+    }
+
     /// Whether the engine has completed background warmup.
     public var isReady: Bool { _isReady.withLock { $0 } }
 
@@ -159,10 +181,10 @@ public final class KokoroEngine: @unchecked Sendable {
     ) throws -> SynthesisResult {
         let t0 = CFAbsoluteTimeGetCurrent()
         let clampedSpeed = Self.clampSpeed(speed)
-        let (fullPhonemes, mergedIds) = prepareChunks(text: text)
+        let prepared = prepareChunks(text: text)
 
         return try synthesizeTokens(
-            phonemes: fullPhonemes, mergedIds: mergedIds, voice: voice,
+            prepared: prepared, voice: voice,
             speed: clampedSpeed, startTime: t0)
     }
 
@@ -172,10 +194,12 @@ public final class KokoroEngine: @unchecked Sendable {
     ) throws -> SynthesisResult {
         let t0 = CFAbsoluteTimeGetCurrent()
         let clampedSpeed = Self.clampSpeed(speed)
-        let mergedIds = chunkAndTokenize(ipa)
+        let prepared = PreparedSynthesis(
+            phonemes: ipa,
+            chunks: chunkAndTokenize(ipa))
 
         return try synthesizeTokens(
-            phonemes: ipa, mergedIds: mergedIds, voice: voice,
+            prepared: prepared, voice: voice,
             speed: clampedSpeed, startTime: t0)
     }
 
@@ -188,35 +212,43 @@ public final class KokoroEngine: @unchecked Sendable {
     ) throws -> SynthesisResult {
         let t0 = CFAbsoluteTimeGetCurrent()
         let clampedSpeed = Self.clampSpeed(speed)
-        let (fullPhonemes, mergedIds) = prepareChunks(text: text)
+        let prepared = prepareChunks(text: text)
 
         return try synthesizeTokensWithEmbedding(
-            phonemes: fullPhonemes, mergedIds: mergedIds,
+            prepared: prepared,
             styleVector: styleVector, speed: clampedSpeed, startTime: t0)
     }
 
     private func synthesizeTokens(
-        phonemes: String, mergedIds: [[Int]], voice: String,
+        prepared: PreparedSynthesis, voice: String,
         speed: Float, startTime: CFAbsoluteTime
     ) throws -> SynthesisResult {
 
         var allSamples: [Float] = []
         var allDurations: [Int] = []
+        var allTimestamps: [SynthesisTimestamp] = []
         var totalTokens = 0
 
-        for tokenIds in mergedIds {
-            totalTokens += tokenIds.count
+        for chunk in prepared.chunks {
+            totalTokens += chunk.tokenIds.count
 
             let styleVector = try voiceStore.embedding(
-                for: voice, tokenCount: tokenIds.count - 2)
+                for: voice, tokenCount: chunk.tokenIds.count - 2)
 
             var (samples, durations) = try synthesizeChunk(
-                tokenIds: tokenIds, styleVector: styleVector, speed: speed)
+                tokenIds: chunk.tokenIds, styleVector: styleVector, speed: speed)
 
             Self.applyFades(&samples)
             if !allSamples.isEmpty {
                 allSamples.append(
                     contentsOf: [Float](repeating: 0, count: Self.interChunkSilence))
+            }
+            let chunkOffset = Double(allSamples.count) / Double(Self.sampleRate)
+            if let tokens = chunk.timestampTokens {
+                allTimestamps.append(
+                    contentsOf: timestamps(
+                        for: tokens, durations: durations,
+                        audioOffset: chunkOffset, sampleCount: samples.count))
             }
             allSamples.append(contentsOf: samples)
             allDurations.append(contentsOf: durations)
@@ -226,30 +258,39 @@ public final class KokoroEngine: @unchecked Sendable {
 
         let elapsed = CFAbsoluteTimeGetCurrent() - startTime
         return SynthesisResult(
-            samples: allSamples, phonemes: phonemes,
+            samples: allSamples, phonemes: prepared.phonemes,
+            timestamps: allTimestamps,
             tokenDurations: allDurations, tokenCount: totalTokens,
             synthesisTime: elapsed)
     }
 
     private func synthesizeTokensWithEmbedding(
-        phonemes: String, mergedIds: [[Int]], styleVector: [Float],
+        prepared: PreparedSynthesis, styleVector: [Float],
         speed: Float, startTime: CFAbsoluteTime
     ) throws -> SynthesisResult {
 
         var allSamples: [Float] = []
         var allDurations: [Int] = []
+        var allTimestamps: [SynthesisTimestamp] = []
         var totalTokens = 0
 
-        for tokenIds in mergedIds {
-            totalTokens += tokenIds.count
+        for chunk in prepared.chunks {
+            totalTokens += chunk.tokenIds.count
 
             var (samples, durations) = try synthesizeChunk(
-                tokenIds: tokenIds, styleVector: styleVector, speed: speed)
+                tokenIds: chunk.tokenIds, styleVector: styleVector, speed: speed)
 
             Self.applyFades(&samples)
             if !allSamples.isEmpty {
                 allSamples.append(
                     contentsOf: [Float](repeating: 0, count: Self.interChunkSilence))
+            }
+            let chunkOffset = Double(allSamples.count) / Double(Self.sampleRate)
+            if let tokens = chunk.timestampTokens {
+                allTimestamps.append(
+                    contentsOf: timestamps(
+                        for: tokens, durations: durations,
+                        audioOffset: chunkOffset, sampleCount: samples.count))
             }
             allSamples.append(contentsOf: samples)
             allDurations.append(contentsOf: durations)
@@ -259,7 +300,8 @@ public final class KokoroEngine: @unchecked Sendable {
 
         let elapsed = CFAbsoluteTimeGetCurrent() - startTime
         return SynthesisResult(
-            samples: allSamples, phonemes: phonemes,
+            samples: allSamples, phonemes: prepared.phonemes,
+            timestamps: allTimestamps,
             tokenDurations: allDurations, tokenCount: totalTokens,
             synthesisTime: elapsed)
     }
@@ -517,46 +559,216 @@ public final class KokoroEngine: @unchecked Sendable {
         min(max(speed, speedRange.lowerBound), speedRange.upperBound)
     }
 
-    private func prepareChunks(text: String) -> (phonemes: String, mergedTokenIds: [[Int]]) {
+    private func prepareChunks(text: String) -> PreparedSynthesis {
         let paragraphs = text.components(separatedBy: .newlines)
             .map { $0.trimmingCharacters(in: .whitespaces) }
             .filter { !$0.isEmpty }
-        let fullPhonemes: String
-        if paragraphs.count <= 1 {
-            fullPhonemes = lockedPhonemize(text)
-        } else {
-            fullPhonemes = paragraphs.map { lockedPhonemize($0) }.joined(separator: " ")
+
+        guard !paragraphs.isEmpty else {
+            let detail = lockedPhonemizeDetailed(text)
+            let chunks: [PreparedChunk]
+            if let tokens = detail.tokens, !tokens.isEmpty {
+                chunks = chunkAndTokenize(timestampTokens: tokens)
+            } else {
+                chunks = chunkAndTokenize(detail.phonemes)
+            }
+            return PreparedSynthesis(
+                phonemes: detail.phonemes,
+                chunks: chunks)
         }
-        return (fullPhonemes, chunkAndTokenize(fullPhonemes))
+
+        var phonemeParts: [String] = []
+        var tokenAccumulator: [MToken] = []
+        var canTimestamp = true
+
+        for (index, paragraph) in paragraphs.enumerated() {
+            let detail = lockedPhonemizeDetailed(paragraph)
+            phonemeParts.append(detail.phonemes)
+
+            guard canTimestamp, let tokens = detail.tokens else {
+                canTimestamp = false
+                continue
+            }
+
+            if index > 0, let last = tokenAccumulator.last {
+                last.whitespace += " "
+            }
+            tokenAccumulator.append(contentsOf: tokens)
+        }
+
+        let fullPhonemes = phonemeParts.joined(separator: " ")
+        let chunks =
+            canTimestamp && !tokenAccumulator.isEmpty
+            ? chunkAndTokenize(timestampTokens: tokenAccumulator)
+            : chunkAndTokenize(fullPhonemes)
+
+        return PreparedSynthesis(phonemes: fullPhonemes, chunks: chunks)
     }
 
-    private func chunkAndTokenize(_ phonemes: String) -> [[Int]] {
+    private func chunkAndTokenize(_ phonemes: String) -> [PreparedChunk] {
         let chunks = Self.chunkPhonemes(
             phonemes, maxPhonemes: Self.maxTokens - Self.tokenPadding)
-        let tokenized = chunks.map { tokenizer.encode($0) }
-
-        var mergedIds: [[Int]] = []
-        var currentIds: [Int] = []
-        for ids in tokenized {
-            let combined =
-                currentIds.isEmpty
-                ? ids
-                : Array(currentIds.dropLast()) + Array(ids.dropFirst())
-            if combined.count <= Self.maxTokens {
-                currentIds = combined
-            } else {
-                if !currentIds.isEmpty { mergedIds.append(currentIds) }
-                currentIds = ids
-            }
+        let prepared = chunks.map {
+            PreparedChunk(tokenIds: tokenizer.encode($0), timestampTokens: nil)
         }
-        if !currentIds.isEmpty { mergedIds.append(currentIds) }
-        return mergedIds
+        return mergePreparedChunks(prepared)
     }
 
-    private func lockedPhonemize(_ text: String) -> String {
+    private func chunkAndTokenize(timestampTokens tokens: [MToken]) -> [PreparedChunk] {
+        let timestampTokens = tokens.map(TimestampToken.init)
+        let tokenChunks = chunkTimestampTokens(
+            timestampTokens, maxPhonemes: Self.maxTokens - Self.tokenPadding)
+        let prepared = tokenChunks.compactMap { rawTokens -> PreparedChunk? in
+            let chunkTokens = Self.timestampCopies(for: rawTokens)
+            let phonemes = Self.renderPhonemes(for: chunkTokens)
+            guard !phonemes.isEmpty else { return nil }
+            return PreparedChunk(
+                tokenIds: tokenizer.encode(phonemes),
+                timestampTokens: chunkTokens)
+        }
+
+        return prepared.isEmpty ? chunkAndTokenize("") : mergePreparedChunks(prepared)
+    }
+
+    private func mergePreparedChunks(_ chunks: [PreparedChunk]) -> [PreparedChunk] {
+        var merged: [PreparedChunk] = []
+        var current: PreparedChunk?
+
+        for chunk in chunks {
+            guard let existing = current else {
+                current = chunk
+                continue
+            }
+
+            let combined =
+                Array(existing.tokenIds.dropLast()) + Array(chunk.tokenIds.dropFirst())
+            if combined.count <= Self.maxTokens {
+                let timestampTokens: [TimestampToken]?
+                if let existingTokens = existing.timestampTokens,
+                    let chunkTokens = chunk.timestampTokens
+                {
+                    timestampTokens = existingTokens + chunkTokens
+                } else {
+                    timestampTokens = nil
+                }
+                current = PreparedChunk(tokenIds: combined, timestampTokens: timestampTokens)
+            } else {
+                merged.append(existing)
+                current = chunk
+            }
+        }
+
+        if let current { merged.append(current) }
+        return merged
+    }
+
+    private func chunkTimestampTokens(
+        _ tokens: [TimestampToken], maxPhonemes: Int
+    ) -> [[TimestampToken]] {
+        guard encodedCount(forTimestampTokens: tokens) > maxPhonemes else {
+            return tokens.isEmpty ? [] : [tokens]
+        }
+
+        var chunks: [[TimestampToken]] = []
+        var current: [TimestampToken] = []
+
+        for token in tokens {
+            if !current.isEmpty {
+                let candidate = current + [token]
+                let candidateCount = encodedCount(forTimestampTokens: candidate)
+                if candidateCount > maxPhonemes {
+                    let split = waterfallSplitIndex(
+                        in: current, candidateCount: candidateCount,
+                        maxPhonemes: maxPhonemes)
+                    if split > 0 {
+                        chunks.append(Array(current[..<split]))
+                    }
+                    current = Array(current[split...])
+
+                    if !current.isEmpty,
+                        encodedCount(forTimestampTokens: current + [token]) > maxPhonemes
+                    {
+                        chunks.append(current)
+                        current = []
+                    }
+                }
+            }
+
+            current.append(token)
+        }
+
+        if !current.isEmpty { chunks.append(current) }
+        return chunks
+    }
+
+    private func waterfallSplitIndex(
+        in tokens: [TimestampToken], candidateCount: Int, maxPhonemes: Int
+    ) -> Int {
+        let waterfallSets: [Set<Character>] = [
+            Set("!.?\u{2026}"),
+            Set(":;"),
+            Set(",\u{2014}"),
+        ]
+        let bumps: Set<Character> = Set(")\u{201D}")
+
+        for punctSet in waterfallSets {
+            guard
+                let index = tokens.indices.reversed().first(where: { idx in
+                    let phonemes = tokens[idx].phonemes
+                    guard phonemes.count == 1,
+                        let char = phonemes.first
+                    else { return false }
+                    return punctSet.contains(char)
+                })
+            else { continue }
+
+            var split = index + 1
+            if split < tokens.count {
+                let phonemes = tokens[split].phonemes
+                if phonemes.count == 1,
+                    let char = phonemes.first, bumps.contains(char)
+                {
+                    split += 1
+                }
+            }
+
+            let prefixCount = encodedCount(
+                forTimestampTokens: Array(tokens[..<split]))
+            if candidateCount - prefixCount <= maxPhonemes {
+                return split
+            }
+        }
+
+        return tokens.count
+    }
+
+    private func encodedCount(forTimestampTokens tokens: [TimestampToken]) -> Int {
+        tokenizer.encodedSymbolCount(
+            Self.renderPhonemes(for: tokens).trimmingCharacters(in: .whitespaces))
+    }
+
+    private static func timestampCopies(for tokens: [TimestampToken]) -> [TimestampToken] {
+        var copies = tokens
+        if !copies.isEmpty {
+            copies[copies.index(before: copies.endIndex)].whitespace = ""
+        }
+        return copies
+    }
+
+    private static func renderPhonemes(for tokens: [TimestampToken]) -> String {
+        tokens.map { $0.phonemes + $0.whitespace }.joined()
+    }
+
+    private func lockedPhonemizeDetailed(_ text: String) -> (phonemes: String, tokens: [MToken]?) {
         g2pLock.lock()
         defer { g2pLock.unlock() }
-        return phonemizer.phonemize(text)
+
+        if let english = phonemizer as? EnglishG2P {
+            let (phonemes, tokens) = english.phonemize(text: text)
+            return (phonemes, tokens)
+        }
+
+        return (phonemizer.phonemize(text), nil)
     }
 
     static func chunkPhonemes(_ phonemes: String, maxPhonemes: Int) -> [String] {
@@ -599,6 +811,80 @@ public final class KokoroEngine: @unchecked Sendable {
         if !tail.isEmpty { chunks.append(tail) }
 
         return chunks
+    }
+
+    private func timestamps(
+        for tokens: [TimestampToken],
+        durations: [Int],
+        audioOffset: TimeInterval,
+        sampleCount: Int
+    ) -> [SynthesisTimestamp] {
+        guard !tokens.isEmpty, durations.count >= 3 else { return [] }
+
+        let frameSeconds = Double(Self.hopSize) / Double(Self.sampleRate)
+        let halfFrameSeconds = frameSeconds / 2
+        let leadingTrim = Double(durations.first ?? 0) * frameSeconds
+        let chunkEnd = audioOffset + Double(sampleCount) / Double(Self.sampleRate)
+
+        func durationSum(_ range: Range<Int>) -> Int {
+            guard range.lowerBound < range.upperBound else { return 0 }
+            return durations[range].reduce(0, +)
+        }
+
+        func adjustedTime(_ rawTime: TimeInterval) -> TimeInterval {
+            min(chunkEnd, max(audioOffset, audioOffset + rawTime - leadingTrim))
+        }
+
+        var results: [SynthesisTimestamp] = []
+        var left = 2 * max(0, (durations.first ?? 0) - 3)
+        var right = left
+        var index = 1
+
+        for token in tokens {
+            guard index < durations.count - 1 else { break }
+
+            let phonemes = token.phonemes
+            let phonemeCount = tokenizer.encodedSymbolCount(phonemes)
+            let whitespaceCount =
+                token.whitespace.isEmpty ? 0 : tokenizer.encodedSymbolCount(token.whitespace)
+
+            guard phonemeCount > 0 else {
+                let whitespaceEnd = min(index + whitespaceCount, durations.count - 1)
+                if whitespaceEnd > index {
+                    let whitespaceDur = durationSum(index..<whitespaceEnd)
+                    left = right + whitespaceDur
+                    right = left + whitespaceDur
+                    index = whitespaceEnd
+                }
+                continue
+            }
+
+            let phonemeEnd = min(index + phonemeCount, durations.count - 1)
+            guard phonemeEnd > index else { break }
+
+            let rawStart = Double(left) * halfFrameSeconds
+            let tokenDur = durationSum(index..<phonemeEnd)
+            let whitespaceEnd = min(phonemeEnd + whitespaceCount, durations.count - 1)
+            let whitespaceDur = durationSum(phonemeEnd..<whitespaceEnd)
+
+            left = right + 2 * tokenDur + whitespaceDur
+            let rawEnd = Double(left) * halfFrameSeconds
+            right = left + whitespaceDur
+            index = whitespaceEnd
+
+            let startTime = adjustedTime(rawStart)
+            let endTime = max(startTime, adjustedTime(rawEnd))
+            guard endTime > startTime else { continue }
+
+            results.append(
+                SynthesisTimestamp(
+                    text: token.text,
+                    phonemes: phonemes,
+                    startTime: startTime,
+                    endTime: endTime))
+        }
+
+        return results
     }
 
     /// Synthesize a single chunk of token IDs.
@@ -784,22 +1070,22 @@ public final class KokoroEngine: @unchecked Sendable {
         }
 
         let clampedSpeed = Self.clampSpeed(speed)
-        let (_, mergedIds) = prepareChunks(text: text)
-        guard !mergedIds.isEmpty else { return AsyncStream { $0.finish() } }
+        let prepared = prepareChunks(text: text)
+        guard !prepared.chunks.isEmpty else { return AsyncStream { $0.finish() } }
 
         return AsyncStream { continuation in
             let thread = Thread {
                 let format = Self.audioFormat
 
-                for tokenIds in mergedIds {
+                for chunk in prepared.chunks {
                     if Thread.current.isCancelled { break }
 
                     do {
                         let styleVector = try self.voiceStore.embedding(
-                            for: voice, tokenCount: tokenIds.count - 2)
+                            for: voice, tokenCount: chunk.tokenIds.count - 2)
 
                         var (samples, _) = try self.synthesizeChunk(
-                            tokenIds: tokenIds, styleVector: styleVector,
+                            tokenIds: chunk.tokenIds, styleVector: styleVector,
                             speed: clampedSpeed)
                         Self.applyFades(&samples)
                         Self.postProcess(&samples)
@@ -830,19 +1116,19 @@ public final class KokoroEngine: @unchecked Sendable {
         speed: Float = 1.0
     ) throws -> AsyncStream<SpeakEvent> {
         let clampedSpeed = Self.clampSpeed(speed)
-        let (_, mergedIds) = prepareChunks(text: text)
-        guard !mergedIds.isEmpty else { return AsyncStream { $0.finish() } }
+        let prepared = prepareChunks(text: text)
+        guard !prepared.chunks.isEmpty else { return AsyncStream { $0.finish() } }
 
         return AsyncStream { continuation in
             let thread = Thread {
                 let format = Self.audioFormat
 
-                for tokenIds in mergedIds {
+                for chunk in prepared.chunks {
                     if Thread.current.isCancelled { break }
 
                     do {
                         var (samples, _) = try self.synthesizeChunk(
-                            tokenIds: tokenIds, styleVector: styleVector,
+                            tokenIds: chunk.tokenIds, styleVector: styleVector,
                             speed: clampedSpeed)
                         Self.applyFades(&samples)
                         Self.postProcess(&samples)
@@ -898,6 +1184,36 @@ public enum SpeakEvent: @unchecked Sendable {
 
 // MARK: - SynthesisResult
 
+/// Timestamp for a synthesized text token.
+public struct SynthesisTimestamp: Sendable, Equatable {
+    /// Original text token.
+    public let text: String
+
+    /// IPA phonemes used to synthesize this token.
+    public let phonemes: String
+
+    /// Start time in seconds, relative to ``SynthesisResult/samples``.
+    public let startTime: TimeInterval
+
+    /// End time in seconds, relative to ``SynthesisResult/samples``.
+    public let endTime: TimeInterval
+
+    /// Token duration in seconds.
+    public var duration: TimeInterval { endTime - startTime }
+
+    public init(
+        text: String,
+        phonemes: String,
+        startTime: TimeInterval,
+        endTime: TimeInterval
+    ) {
+        self.text = text
+        self.phonemes = phonemes
+        self.startTime = startTime
+        self.endTime = endTime
+    }
+}
+
 /// Result from a text-to-speech synthesis call.
 public struct SynthesisResult: Sendable {
     /// 24kHz mono PCM float samples.
@@ -905,6 +1221,13 @@ public struct SynthesisResult: Sendable {
 
     /// IPA phoneme string produced by the G2P pipeline.
     public let phonemes: String
+
+    /// Text-token timestamps in seconds, relative to ``samples``.
+    ///
+    /// Populated for text synthesis when the built-in English G2P pipeline is used.
+    /// Pre-phonemized IPA and custom phonemizers that do not expose token metadata
+    /// return an empty array.
+    public let timestamps: [SynthesisTimestamp]
 
     /// Per-token predicted durations in audio frames.
     let tokenDurations: [Int]
@@ -928,12 +1251,14 @@ public struct SynthesisResult: Sendable {
     init(
         samples: [Float],
         phonemes: String = "",
+        timestamps: [SynthesisTimestamp] = [],
         tokenDurations: [Int] = [],
         tokenCount: Int,
         synthesisTime: TimeInterval
     ) {
         self.samples = samples
         self.phonemes = phonemes
+        self.timestamps = timestamps
         self.tokenDurations = tokenDurations
         self.tokenCount = tokenCount
         self.synthesisTime = synthesisTime
