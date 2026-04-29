@@ -172,11 +172,12 @@ struct Say: AsyncParsableCommand {
             print("Wrote \(output)")
         }
         if play || showText || (output == nil && !debug) {
-            if showText {
-                try playAudio(samples: result.samples, timestamps: result.timestamps)
-            } else {
-                try playAudio(samples: result.samples)
+            if showText && result.timestamps.isEmpty {
+                fputs("Text timestamps unavailable\n", stderr)
             }
+            try playAudio(
+                samples: result.samples,
+                timestamps: showText ? result.timestamps : [])
         }
 
         // Occasional daemon hint (not in --debug mode where user chose local)
@@ -201,11 +202,8 @@ struct Say: AsyncParsableCommand {
             throw ExitCode.failure
         }
 
-        if showText {
-            try await streamPlaybackWithText(engine: engine, text: inputText, voice: voice)
-        } else {
-            try await streamPlayback(engine: engine, text: inputText, voice: voice)
-        }
+        try await streamPlayback(
+            engine: engine, text: inputText, voice: voice, showText: showText)
     }
 
     // MARK: - Input
@@ -232,15 +230,12 @@ struct Say: AsyncParsableCommand {
 
     // MARK: - Audio Helpers
 
-    private func startAudioPlayer(autoplay: Bool = true) throws -> (
-        AVAudioEngine, AVAudioPlayerNode
-    ) {
+    private func startAudioPlayer() throws -> (AVAudioEngine, AVAudioPlayerNode) {
         let audioEngine = AVAudioEngine()
         let player = AVAudioPlayerNode()
         audioEngine.attach(player)
         audioEngine.connect(player, to: audioEngine.mainMixerNode, format: KokoroEngine.audioFormat)
         try audioEngine.start()
-        if autoplay { player.play() }
         return (audioEngine, player)
     }
 
@@ -263,30 +258,8 @@ struct Say: AsyncParsableCommand {
         try file.write(from: buf)
     }
 
-    private func playAudio(samples: [Float]) throws {
-        let (audioEngine, player) = try startAudioPlayer(autoplay: false)
-        defer { audioEngine.stop() }
-
-        guard let buf = KokoroEngine.makePCMBuffer(from: samples, format: KokoroEngine.audioFormat)
-        else {
-            fputs("Failed to create audio buffer\n", stderr)
-            throw ExitCode.failure
-        }
-        let done = DispatchSemaphore(value: 0)
-        player.scheduleBuffer(buf) { done.signal() }
-        player.play()
-        done.wait()
-        Thread.sleep(forTimeInterval: 0.1)
-    }
-
-    private func playAudio(samples: [Float], timestamps: [SynthesisTimestamp]) throws {
-        guard !timestamps.isEmpty else {
-            fputs("Text timestamps unavailable\n", stderr)
-            try playAudio(samples: samples)
-            return
-        }
-
-        let (audioEngine, player) = try startAudioPlayer(autoplay: false)
+    private func playAudio(samples: [Float], timestamps: [SynthesisTimestamp] = []) throws {
+        let (audioEngine, player) = try startAudioPlayer()
         defer { audioEngine.stop() }
 
         guard let buf = KokoroEngine.makePCMBuffer(from: samples, format: KokoroEngine.audioFormat)
@@ -295,82 +268,46 @@ struct Say: AsyncParsableCommand {
             throw ExitCode.failure
         }
 
-        let printer = LiveTextPrinter(player: player)
-        printer.append(timestamps)
+        let printer = timestamps.isEmpty ? nil : LiveTextPrinter(player: player)
+        printer?.append(timestamps)
+
         let done = DispatchSemaphore(value: 0)
         player.scheduleBuffer(buf) { done.signal() }
-        printer.start()
+        printer?.start()
         player.play()
         done.wait()
-        printer.finish()
-        printer.wait()
+        printer?.finish()
         Thread.sleep(forTimeInterval: 0.1)
     }
 
     // MARK: - Streaming
 
-    private func streamPlayback(engine: KokoroEngine, text: String, voice: String) async throws {
+    private func streamPlayback(
+        engine: KokoroEngine, text: String, voice: String, showText: Bool
+    ) async throws {
         let (audioEngine, player) = try startAudioPlayer()
         defer { audioEngine.stop() }
 
+        let printer = showText ? LiveTextPrinter(player: player) : nil
+        defer { printer?.finish() }
+
         let t0 = CFAbsoluteTimeGetCurrent()
         var chunks = 0
         var totalFrames: AVAudioFrameCount = 0
         var reportedFirst = false
-
-        for await event in try engine.speak(text, voice: voice, speed: speed) {
-            switch event {
-            case .audio(let buffer):
-                chunks += 1
-                totalFrames += buffer.frameLength
-                player.scheduleBuffer(buffer, completionHandler: nil)
-                if !reportedFirst {
-                    reportedFirst = true
-                    let latency = CFAbsoluteTimeGetCurrent() - t0
-                    print("[\(voice)] first audio in \(Int(latency * 1000))ms")
-                }
-            case .chunkFailed(let error):
-                print("[\(voice)] chunk failed: \(error.localizedDescription)")
-            }
-        }
-
-        let duration = Double(totalFrames) / KokoroEngine.audioFormat.sampleRate
-        let elapsed = CFAbsoluteTimeGetCurrent() - t0
-        let synthMs = Int(elapsed * 1000)
-        let durStr = String(format: "%.1f", duration)
-        print("[\(voice)] \(chunks) chunks, \(durStr)s audio, \(synthMs)ms total synth")
-
-        await player.scheduleBuffer(makeSentinelBuffer())
-        try await Task.sleep(for: .milliseconds(100))
-    }
-
-    private func streamPlaybackWithText(
-        engine: KokoroEngine,
-        text: String,
-        voice: String
-    ) async throws {
-        let (audioEngine, player) = try startAudioPlayer(autoplay: false)
-        defer { audioEngine.stop() }
-
-        let printer = LiveTextPrinter(player: player)
-        let t0 = CFAbsoluteTimeGetCurrent()
-        var chunks = 0
-        var totalFrames: AVAudioFrameCount = 0
-        var reportedFirst = false
-        defer { printer.finish(); printer.wait() }
 
         for await event in try engine.speakWithTimestamps(text, voice: voice, speed: speed) {
             switch event {
             case .audio(let buffer, let timestamps):
                 chunks += 1
                 totalFrames += buffer.frameLength
-                printer.append(timestamps)
+                printer?.append(timestamps)
                 player.scheduleBuffer(buffer, completionHandler: nil)
                 if !reportedFirst {
                     reportedFirst = true
                     let latency = CFAbsoluteTimeGetCurrent() - t0
                     print("[\(voice)] first audio in \(Int(latency * 1000))ms")
-                    printer.start()
+                    printer?.start()
                     player.play()
                 }
             case .chunkFailed(let error):
@@ -389,9 +326,6 @@ struct Say: AsyncParsableCommand {
         }
 
         await player.scheduleBuffer(makeSentinelBuffer())
-        printer.finish()
-        printer.wait()
-
         print("[\(voice)] \(chunks) chunks, \(durStr)s audio, \(synthMs)ms total synth")
         try await Task.sleep(for: .milliseconds(100))
     }
@@ -427,7 +361,6 @@ private final class LiveTextPrinter: @unchecked Sendable {
     private var nextIndex = 0
     private var finished = false
     private var started = false
-    private var waited = false
     private var fallbackStart: CFAbsoluteTime = 0
 
     init(player: AVAudioPlayerNode) {
@@ -442,10 +375,7 @@ private final class LiveTextPrinter: @unchecked Sendable {
 
     func start() {
         lock.lock()
-        guard !started else {
-            lock.unlock()
-            return
-        }
+        guard !started, !finished else { lock.unlock(); return }
         started = true
         fallbackStart = CFAbsoluteTimeGetCurrent()
         lock.unlock()
@@ -455,21 +385,14 @@ private final class LiveTextPrinter: @unchecked Sendable {
         thread.start()
     }
 
+    /// Mark the printer as done and block until its trailing newline is flushed.
     func finish() {
         lock.lock()
-        guard !finished else { lock.unlock(); return }
+        let alreadyFinished = finished
         finished = true
-        let shouldSignal = !started
+        let needsWait = started && !alreadyFinished
         lock.unlock()
-        if shouldSignal { done.signal() }
-    }
-
-    func wait() {
-        lock.lock()
-        guard !waited else { lock.unlock(); return }
-        waited = true
-        lock.unlock()
-        done.wait()
+        if needsWait { done.wait() }
     }
 
     private func run() {

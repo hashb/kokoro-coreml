@@ -74,6 +74,13 @@ public final class KokoroEngine: @unchecked Sendable {
     /// Silence samples inserted between chunks (100ms at 24kHz).
     private static let interChunkSilence = 2400
 
+    private static let waterfallPunctuation: [Set<Character>] = [
+        Set("!.?\u{2026}"),
+        Set(":;"),
+        Set(",\u{2014}"),
+    ]
+    private static let waterfallBumps: Set<Character> = Set(")\u{201D}")
+
     private enum Feature {
         static let inputIds = "input_ids"
         static let attentionMask = "attention_mask"
@@ -186,12 +193,12 @@ public final class KokoroEngine: @unchecked Sendable {
         text: String, voice: String, speed: Float = 1.0
     ) throws -> SynthesisResult {
         let t0 = CFAbsoluteTimeGetCurrent()
-        let clampedSpeed = Self.clampSpeed(speed)
         let prepared = prepareChunks(text: text)
-
         return try synthesizeTokens(
-            prepared: prepared, voice: voice,
-            speed: clampedSpeed, startTime: t0)
+            prepared: prepared, speed: Self.clampSpeed(speed), startTime: t0
+        ) { tokenCount in
+            try voiceStore.embedding(for: voice, tokenCount: tokenCount - 2)
+        }
     }
 
     /// Synthesize pre-phonemized IPA text to PCM audio samples.
@@ -199,14 +206,12 @@ public final class KokoroEngine: @unchecked Sendable {
         ipa: String, voice: String, speed: Float = 1.0
     ) throws -> SynthesisResult {
         let t0 = CFAbsoluteTimeGetCurrent()
-        let clampedSpeed = Self.clampSpeed(speed)
-        let prepared = PreparedSynthesis(
-            phonemes: ipa,
-            chunks: chunkAndTokenize(ipa))
-
+        let prepared = PreparedSynthesis(phonemes: ipa, chunks: chunkAndTokenize(ipa))
         return try synthesizeTokens(
-            prepared: prepared, voice: voice,
-            speed: clampedSpeed, startTime: t0)
+            prepared: prepared, speed: Self.clampSpeed(speed), startTime: t0
+        ) { tokenCount in
+            try voiceStore.embedding(for: voice, tokenCount: tokenCount - 2)
+        }
     }
 
     /// Synthesize text using a raw 256-dim style vector instead of a named voice.
@@ -217,17 +222,17 @@ public final class KokoroEngine: @unchecked Sendable {
         text: String, styleVector: [Float], speed: Float = 1.0
     ) throws -> SynthesisResult {
         let t0 = CFAbsoluteTimeGetCurrent()
-        let clampedSpeed = Self.clampSpeed(speed)
         let prepared = prepareChunks(text: text)
-
-        return try synthesizeTokensWithEmbedding(
-            prepared: prepared,
-            styleVector: styleVector, speed: clampedSpeed, startTime: t0)
+        return try synthesizeTokens(
+            prepared: prepared, speed: Self.clampSpeed(speed), startTime: t0
+        ) { _ in styleVector }
     }
 
     private func synthesizeTokens(
-        prepared: PreparedSynthesis, voice: String,
-        speed: Float, startTime: CFAbsoluteTime
+        prepared: PreparedSynthesis,
+        speed: Float,
+        startTime: CFAbsoluteTime,
+        styleVectorFor: (Int) throws -> [Float]
     ) throws -> SynthesisResult {
 
         var allSamples: [Float] = []
@@ -238,9 +243,7 @@ public final class KokoroEngine: @unchecked Sendable {
         for chunk in prepared.chunks {
             totalTokens += chunk.tokenIds.count
 
-            let styleVector = try voiceStore.embedding(
-                for: voice, tokenCount: chunk.tokenIds.count - 2)
-
+            let styleVector = try styleVectorFor(chunk.tokenIds.count)
             var (samples, durations) = try synthesizeChunk(
                 tokenIds: chunk.tokenIds, styleVector: styleVector, speed: speed)
 
@@ -249,51 +252,8 @@ public final class KokoroEngine: @unchecked Sendable {
                 allSamples.append(
                     contentsOf: [Float](repeating: 0, count: Self.interChunkSilence))
             }
-            let chunkOffset = Double(allSamples.count) / Double(Self.sampleRate)
             if let tokens = chunk.timestampTokens {
-                allTimestamps.append(
-                    contentsOf: Self.timestamps(
-                        for: tokens, durations: durations,
-                        audioOffset: chunkOffset, sampleCount: samples.count,
-                        tokenizer: tokenizer))
-            }
-            allSamples.append(contentsOf: samples)
-            allDurations.append(contentsOf: durations)
-        }
-
-        Self.postProcess(&allSamples)
-
-        let elapsed = CFAbsoluteTimeGetCurrent() - startTime
-        return SynthesisResult(
-            samples: allSamples, phonemes: prepared.phonemes,
-            timestamps: allTimestamps,
-            tokenDurations: allDurations, tokenCount: totalTokens,
-            synthesisTime: elapsed)
-    }
-
-    private func synthesizeTokensWithEmbedding(
-        prepared: PreparedSynthesis, styleVector: [Float],
-        speed: Float, startTime: CFAbsoluteTime
-    ) throws -> SynthesisResult {
-
-        var allSamples: [Float] = []
-        var allDurations: [Int] = []
-        var allTimestamps: [SynthesisTimestamp] = []
-        var totalTokens = 0
-
-        for chunk in prepared.chunks {
-            totalTokens += chunk.tokenIds.count
-
-            var (samples, durations) = try synthesizeChunk(
-                tokenIds: chunk.tokenIds, styleVector: styleVector, speed: speed)
-
-            Self.applyFades(&samples)
-            if !allSamples.isEmpty {
-                allSamples.append(
-                    contentsOf: [Float](repeating: 0, count: Self.interChunkSilence))
-            }
-            let chunkOffset = Double(allSamples.count) / Double(Self.sampleRate)
-            if let tokens = chunk.timestampTokens {
+                let chunkOffset = Double(allSamples.count) / Double(Self.sampleRate)
                 allTimestamps.append(
                     contentsOf: Self.timestamps(
                         for: tokens, durations: durations,
@@ -628,7 +588,8 @@ public final class KokoroEngine: @unchecked Sendable {
             timestampTokens, maxPhonemes: Self.maxTokens - Self.tokenPadding,
             tokenizer: tokenizer)
         let prepared = tokenChunks.compactMap { rawTokens -> PreparedChunk? in
-            let chunkTokens = Self.timestampCopies(for: rawTokens)
+            var chunkTokens = rawTokens
+            if !chunkTokens.isEmpty { chunkTokens[chunkTokens.count - 1].whitespace = "" }
             let phonemes = Self.renderPhonemes(for: chunkTokens)
             guard !phonemes.isEmpty else { return nil }
             return PreparedChunk(
@@ -636,7 +597,7 @@ public final class KokoroEngine: @unchecked Sendable {
                 timestampTokens: chunkTokens)
         }
 
-        return prepared.isEmpty ? chunkAndTokenize("") : Self.mergePreparedChunks(prepared)
+        return Self.mergePreparedChunks(prepared)
     }
 
     static func mergePreparedChunks(_ chunks: [PreparedChunk]) -> [PreparedChunk] {
@@ -649,22 +610,24 @@ public final class KokoroEngine: @unchecked Sendable {
                 continue
             }
 
-            let combined =
-                Array(existing.tokenIds.dropLast()) + Array(chunk.tokenIds.dropFirst())
-            if combined.count <= Self.maxTokens {
-                let timestampTokens: [TimestampToken]?
-                if let existingTokens = existing.timestampTokens,
-                    let chunkTokens = chunk.timestampTokens
-                {
-                    timestampTokens = existingTokens + chunkTokens
-                } else {
-                    timestampTokens = nil
-                }
-                current = PreparedChunk(tokenIds: combined, timestampTokens: timestampTokens)
-            } else {
+            let combinedCount = existing.tokenIds.count + chunk.tokenIds.count - 2
+            guard combinedCount <= Self.maxTokens else {
                 merged.append(existing)
                 current = chunk
+                continue
             }
+
+            let combined = existing.tokenIds.dropLast() + chunk.tokenIds.dropFirst()
+            let timestampTokens: [TimestampToken]?
+            if let existingTokens = existing.timestampTokens,
+                let chunkTokens = chunk.timestampTokens
+            {
+                timestampTokens = existingTokens + chunkTokens
+            } else {
+                timestampTokens = nil
+            }
+            current = PreparedChunk(
+                tokenIds: Array(combined), timestampTokens: timestampTokens)
         }
 
         if let current { merged.append(current) }
@@ -717,14 +680,7 @@ public final class KokoroEngine: @unchecked Sendable {
         in tokens: [TimestampToken], candidateCount: Int, maxPhonemes: Int,
         tokenizer: Tokenizer
     ) -> Int {
-        let waterfallSets: [Set<Character>] = [
-            Set("!.?\u{2026}"),
-            Set(":;"),
-            Set(",\u{2014}"),
-        ]
-        let bumps: Set<Character> = Set(")\u{201D}")
-
-        for punctSet in waterfallSets {
+        for punctSet in waterfallPunctuation {
             guard
                 let index = tokens.indices.reversed().first(where: { idx in
                     let phonemes = tokens[idx].phonemes
@@ -739,7 +695,7 @@ public final class KokoroEngine: @unchecked Sendable {
             if split < tokens.count {
                 let phonemes = tokens[split].phonemes
                 if phonemes.count == 1,
-                    let char = phonemes.first, bumps.contains(char)
+                    let char = phonemes.first, waterfallBumps.contains(char)
                 {
                     split += 1
                 }
@@ -762,14 +718,6 @@ public final class KokoroEngine: @unchecked Sendable {
             Self.renderPhonemes(for: tokens).trimmingCharacters(in: .whitespaces))
     }
 
-    private static func timestampCopies(for tokens: [TimestampToken]) -> [TimestampToken] {
-        var copies = tokens
-        if !copies.isEmpty {
-            copies[copies.index(before: copies.endIndex)].whitespace = ""
-        }
-        return copies
-    }
-
     private static func renderPhonemes(for tokens: [TimestampToken]) -> String {
         tokens.map { $0.phonemes + $0.whitespace }.joined()
     }
@@ -789,12 +737,6 @@ public final class KokoroEngine: @unchecked Sendable {
     static func chunkPhonemes(_ phonemes: String, maxPhonemes: Int) -> [String] {
         guard phonemes.count > maxPhonemes else { return [phonemes] }
 
-        let waterfallSets: [Set<Character>] = [
-            Set("!.?\u{2026}"),
-            Set(":;"),
-            Set(",\u{2014}"),
-        ]
-
         var chunks: [String] = []
         var remaining = phonemes[...]
 
@@ -802,7 +744,7 @@ public final class KokoroEngine: @unchecked Sendable {
             let window = remaining.prefix(maxPhonemes)
             var splitIndex: String.Index?
 
-            for punctSet in waterfallSets {
+            for punctSet in waterfallPunctuation {
                 if let idx = window.lastIndex(where: { punctSet.contains($0) }) {
                     splitIndex = window.index(after: idx)
                     break
