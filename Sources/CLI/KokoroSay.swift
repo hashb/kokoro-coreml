@@ -45,6 +45,9 @@ struct Say: AsyncParsableCommand {
     @Flag(name: .long, help: "Print debug information")
     var debug = false
 
+    @Flag(name: .long, help: "Print synthesized text tokens with timestamps")
+    var showText = false
+
     @Flag(name: .long, help: "List available voices")
     var listVoices = false
 
@@ -60,6 +63,12 @@ struct Say: AsyncParsableCommand {
         }
         if stream && output != nil {
             throw ValidationError("--stream and --output cannot be used together")
+        }
+        if showText && stream {
+            throw ValidationError("--show-text cannot be used with --stream")
+        }
+        if showText && ipa {
+            throw ValidationError("--show-text cannot be used with --ipa")
         }
     }
 
@@ -98,8 +107,8 @@ struct Say: AsyncParsableCommand {
         // Resolve text once for both paths
         let inputText = try resolveText()
 
-        // Try daemon (unless --debug or --ipa which need local engine)
-        if !debug && !ipa {
+        // Try daemon (unless local-only output is requested)
+        if !debug && !ipa && !showText {
             let request = SynthesisRequest(
                 text: inputText, voice: voice, speed: speed)
             switch DaemonClient.synthesize(request) {
@@ -162,12 +171,16 @@ struct Say: AsyncParsableCommand {
             try writeWAV(samples: result.samples, to: output)
             print("Wrote \(output)")
         }
-        if play || (output == nil && !debug) {
-            try playAudio(samples: result.samples)
+        if play || showText || (output == nil && !debug) {
+            if showText {
+                try playAudio(samples: result.samples, timestamps: result.timestamps)
+            } else {
+                try playAudio(samples: result.samples)
+            }
         }
 
         // Occasional daemon hint (not in --debug mode where user chose local)
-        if !debug && Int.random(in: 0..<3) == 0 {
+        if !debug && !showText && Int.random(in: 0..<3) == 0 {
             fputs("Tip: run 'kokoro daemon start' for faster synthesis\n", stderr)
         }
     }
@@ -215,13 +228,15 @@ struct Say: AsyncParsableCommand {
 
     // MARK: - Audio Helpers
 
-    private func startAudioPlayer() throws -> (AVAudioEngine, AVAudioPlayerNode) {
+    private func startAudioPlayer(autoplay: Bool = true) throws -> (
+        AVAudioEngine, AVAudioPlayerNode
+    ) {
         let audioEngine = AVAudioEngine()
         let player = AVAudioPlayerNode()
         audioEngine.attach(player)
         audioEngine.connect(player, to: audioEngine.mainMixerNode, format: KokoroEngine.audioFormat)
         try audioEngine.start()
-        player.play()
+        if autoplay { player.play() }
         return (audioEngine, player)
     }
 
@@ -245,7 +260,7 @@ struct Say: AsyncParsableCommand {
     }
 
     private func playAudio(samples: [Float]) throws {
-        let (audioEngine, player) = try startAudioPlayer()
+        let (audioEngine, player) = try startAudioPlayer(autoplay: false)
         defer { audioEngine.stop() }
 
         guard let buf = KokoroEngine.makePCMBuffer(from: samples, format: KokoroEngine.audioFormat)
@@ -255,8 +270,83 @@ struct Say: AsyncParsableCommand {
         }
         let done = DispatchSemaphore(value: 0)
         player.scheduleBuffer(buf) { done.signal() }
+        player.play()
         done.wait()
         Thread.sleep(forTimeInterval: 0.1)
+    }
+
+    private func playAudio(samples: [Float], timestamps: [SynthesisTimestamp]) throws {
+        guard !timestamps.isEmpty else {
+            fputs("Text timestamps unavailable\n", stderr)
+            try playAudio(samples: samples)
+            return
+        }
+
+        let (audioEngine, player) = try startAudioPlayer(autoplay: false)
+        defer { audioEngine.stop() }
+
+        guard let buf = KokoroEngine.makePCMBuffer(from: samples, format: KokoroEngine.audioFormat)
+        else {
+            fputs("Failed to create audio buffer\n", stderr)
+            throw ExitCode.failure
+        }
+
+        let done = DispatchSemaphore(value: 0)
+        player.scheduleBuffer(buf) { done.signal() }
+
+        fputs("Text: ", stdout)
+        fflush(stdout)
+
+        var index = 0
+        var printedAny = false
+        var playbackDone = false
+        let fallbackStart = CFAbsoluteTimeGetCurrent()
+        player.play()
+
+        while !playbackDone && index < timestamps.count {
+            let currentTime = playbackTime(for: player, fallbackStart: fallbackStart)
+            while index < timestamps.count && timestamps[index].startTime <= currentTime + 0.02 {
+                printLiveToken(timestamps[index].text, printedAny: printedAny)
+                printedAny = true
+                index += 1
+            }
+
+            if done.wait(timeout: .now() + .milliseconds(10)) == .success {
+                playbackDone = true
+            }
+        }
+
+        while index < timestamps.count {
+            printLiveToken(timestamps[index].text, printedAny: printedAny)
+            printedAny = true
+            index += 1
+        }
+
+        if !playbackDone { done.wait() }
+        if printedAny { fputs("\n", stdout) }
+        Thread.sleep(forTimeInterval: 0.1)
+    }
+
+    private func playbackTime(
+        for player: AVAudioPlayerNode,
+        fallbackStart: CFAbsoluteTime
+    ) -> TimeInterval {
+        if let nodeTime = player.lastRenderTime,
+            let playerTime = player.playerTime(forNodeTime: nodeTime),
+            playerTime.sampleRate > 0
+        {
+            return Double(playerTime.sampleTime) / playerTime.sampleRate
+        }
+        return CFAbsoluteTimeGetCurrent() - fallbackStart
+    }
+
+    private func printLiveToken(_ text: String, printedAny: Bool) {
+        let attachesToPrevious = text.first.map { ",.;:!?)]}\u{201D}".contains($0) } ?? false
+        if printedAny && !attachesToPrevious {
+            fputs(" ", stdout)
+        }
+        fputs(text, stdout)
+        fflush(stdout)
     }
 
     // MARK: - Streaming
@@ -319,6 +409,7 @@ struct Say: AsyncParsableCommand {
         print(String(format: "\n  Global peak: %.3f", globalPeak))
         print(String(format: "  Total samples: %d (%.1fs)", result.samples.count, result.duration))
     }
+
 }
 
 // MARK: - Update
