@@ -109,15 +109,21 @@ public final class KokoroEngine: @unchecked Sendable {
         let chunks: [PreparedChunk]
     }
 
-    private struct PreparedChunk: Sendable {
+    struct PreparedChunk: Sendable, Equatable {
         let tokenIds: [Int]
         let timestampTokens: [TimestampToken]?
     }
 
-    private struct TimestampToken: Sendable {
+    struct TimestampToken: Sendable, Equatable {
         let text: String
         let phonemes: String
         var whitespace: String
+
+        init(text: String, phonemes: String, whitespace: String = "") {
+            self.text = text
+            self.phonemes = phonemes
+            self.whitespace = whitespace
+        }
 
         init(_ token: MToken) {
             self.text = token.text
@@ -246,9 +252,10 @@ public final class KokoroEngine: @unchecked Sendable {
             let chunkOffset = Double(allSamples.count) / Double(Self.sampleRate)
             if let tokens = chunk.timestampTokens {
                 allTimestamps.append(
-                    contentsOf: timestamps(
+                    contentsOf: Self.timestamps(
                         for: tokens, durations: durations,
-                        audioOffset: chunkOffset, sampleCount: samples.count))
+                        audioOffset: chunkOffset, sampleCount: samples.count,
+                        tokenizer: tokenizer))
             }
             allSamples.append(contentsOf: samples)
             allDurations.append(contentsOf: durations)
@@ -288,9 +295,10 @@ public final class KokoroEngine: @unchecked Sendable {
             let chunkOffset = Double(allSamples.count) / Double(Self.sampleRate)
             if let tokens = chunk.timestampTokens {
                 allTimestamps.append(
-                    contentsOf: timestamps(
+                    contentsOf: Self.timestamps(
                         for: tokens, durations: durations,
-                        audioOffset: chunkOffset, sampleCount: samples.count))
+                        audioOffset: chunkOffset, sampleCount: samples.count,
+                        tokenizer: tokenizer))
             }
             allSamples.append(contentsOf: samples)
             allDurations.append(contentsOf: durations)
@@ -611,13 +619,14 @@ public final class KokoroEngine: @unchecked Sendable {
         let prepared = chunks.map {
             PreparedChunk(tokenIds: tokenizer.encode($0), timestampTokens: nil)
         }
-        return mergePreparedChunks(prepared)
+        return Self.mergePreparedChunks(prepared)
     }
 
     private func chunkAndTokenize(timestampTokens tokens: [MToken]) -> [PreparedChunk] {
         let timestampTokens = tokens.map(TimestampToken.init)
-        let tokenChunks = chunkTimestampTokens(
-            timestampTokens, maxPhonemes: Self.maxTokens - Self.tokenPadding)
+        let tokenChunks = Self.chunkTimestampTokens(
+            timestampTokens, maxPhonemes: Self.maxTokens - Self.tokenPadding,
+            tokenizer: tokenizer)
         let prepared = tokenChunks.compactMap { rawTokens -> PreparedChunk? in
             let chunkTokens = Self.timestampCopies(for: rawTokens)
             let phonemes = Self.renderPhonemes(for: chunkTokens)
@@ -627,10 +636,10 @@ public final class KokoroEngine: @unchecked Sendable {
                 timestampTokens: chunkTokens)
         }
 
-        return prepared.isEmpty ? chunkAndTokenize("") : mergePreparedChunks(prepared)
+        return prepared.isEmpty ? chunkAndTokenize("") : Self.mergePreparedChunks(prepared)
     }
 
-    private func mergePreparedChunks(_ chunks: [PreparedChunk]) -> [PreparedChunk] {
+    static func mergePreparedChunks(_ chunks: [PreparedChunk]) -> [PreparedChunk] {
         var merged: [PreparedChunk] = []
         var current: PreparedChunk?
 
@@ -662,10 +671,10 @@ public final class KokoroEngine: @unchecked Sendable {
         return merged
     }
 
-    private func chunkTimestampTokens(
-        _ tokens: [TimestampToken], maxPhonemes: Int
+    static func chunkTimestampTokens(
+        _ tokens: [TimestampToken], maxPhonemes: Int, tokenizer: Tokenizer
     ) -> [[TimestampToken]] {
-        guard encodedCount(forTimestampTokens: tokens) > maxPhonemes else {
+        guard encodedCount(forTimestampTokens: tokens, tokenizer: tokenizer) > maxPhonemes else {
             return tokens.isEmpty ? [] : [tokens]
         }
 
@@ -675,18 +684,21 @@ public final class KokoroEngine: @unchecked Sendable {
         for token in tokens {
             if !current.isEmpty {
                 let candidate = current + [token]
-                let candidateCount = encodedCount(forTimestampTokens: candidate)
+                let candidateCount = encodedCount(
+                    forTimestampTokens: candidate, tokenizer: tokenizer)
                 if candidateCount > maxPhonemes {
                     let split = waterfallSplitIndex(
                         in: current, candidateCount: candidateCount,
-                        maxPhonemes: maxPhonemes)
+                        maxPhonemes: maxPhonemes, tokenizer: tokenizer)
                     if split > 0 {
                         chunks.append(Array(current[..<split]))
                     }
                     current = Array(current[split...])
 
                     if !current.isEmpty,
-                        encodedCount(forTimestampTokens: current + [token]) > maxPhonemes
+                        encodedCount(
+                            forTimestampTokens: current + [token], tokenizer: tokenizer)
+                            > maxPhonemes
                     {
                         chunks.append(current)
                         current = []
@@ -701,8 +713,9 @@ public final class KokoroEngine: @unchecked Sendable {
         return chunks
     }
 
-    private func waterfallSplitIndex(
-        in tokens: [TimestampToken], candidateCount: Int, maxPhonemes: Int
+    static func waterfallSplitIndex(
+        in tokens: [TimestampToken], candidateCount: Int, maxPhonemes: Int,
+        tokenizer: Tokenizer
     ) -> Int {
         let waterfallSets: [Set<Character>] = [
             Set("!.?\u{2026}"),
@@ -733,7 +746,7 @@ public final class KokoroEngine: @unchecked Sendable {
             }
 
             let prefixCount = encodedCount(
-                forTimestampTokens: Array(tokens[..<split]))
+                forTimestampTokens: Array(tokens[..<split]), tokenizer: tokenizer)
             if candidateCount - prefixCount <= maxPhonemes {
                 return split
             }
@@ -742,7 +755,9 @@ public final class KokoroEngine: @unchecked Sendable {
         return tokens.count
     }
 
-    private func encodedCount(forTimestampTokens tokens: [TimestampToken]) -> Int {
+    static func encodedCount(forTimestampTokens tokens: [TimestampToken], tokenizer: Tokenizer)
+        -> Int
+    {
         tokenizer.encodedSymbolCount(
             Self.renderPhonemes(for: tokens).trimmingCharacters(in: .whitespaces))
     }
@@ -813,11 +828,12 @@ public final class KokoroEngine: @unchecked Sendable {
         return chunks
     }
 
-    private func timestamps(
+    static func timestamps(
         for tokens: [TimestampToken],
         durations: [Int],
         audioOffset: TimeInterval,
-        sampleCount: Int
+        sampleCount: Int,
+        tokenizer: Tokenizer
     ) -> [SynthesisTimestamp] {
         guard !tokens.isEmpty, durations.count >= 3 else { return [] }
 
@@ -1148,9 +1164,10 @@ public final class KokoroEngine: @unchecked Sendable {
 
                         if let buffer = Self.makePCMBuffer(from: samples, format: format) {
                             let tokenTimestamps = chunk.timestampTokens.map {
-                                self.timestamps(
+                                Self.timestamps(
                                     for: $0, durations: durations,
-                                    audioOffset: audioOffset, sampleCount: samples.count)
+                                    audioOffset: audioOffset, sampleCount: samples.count,
+                                    tokenizer: self.tokenizer)
                             } ?? []
                             audioOffset += Double(buffer.frameLength) / format.sampleRate
                             continuation.yield(.audio(buffer, timestamps: tokenTimestamps))
