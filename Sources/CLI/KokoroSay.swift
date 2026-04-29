@@ -326,6 +326,7 @@ struct Say: AsyncParsableCommand {
         }
 
         await player.scheduleBuffer(makeSentinelBuffer())
+        printer?.finish()
         print("[\(voice)] \(chunks) chunks, \(durStr)s audio, \(synthMs)ms total synth")
         try await Task.sleep(for: .milliseconds(100))
     }
