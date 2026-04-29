@@ -45,7 +45,7 @@ struct Say: AsyncParsableCommand {
     @Flag(name: .long, help: "Print debug information")
     var debug = false
 
-    @Flag(name: .long, help: "Print synthesized text tokens with timestamps")
+    @Flag(name: .long, help: "Show text in sync during playback")
     var showText = false
 
     @Flag(name: .long, help: "List available voices")
@@ -66,6 +66,9 @@ struct Say: AsyncParsableCommand {
         }
         if showText && ipa {
             throw ValidationError("--show-text cannot be used with --ipa")
+        }
+        if showText && output != nil {
+            throw ValidationError("--show-text cannot be used with --output")
         }
     }
 

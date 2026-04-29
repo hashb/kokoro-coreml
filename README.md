@@ -104,7 +104,7 @@ kokoro say --list-voices
 kokoro daemon start   # keep models loaded, 3x faster repeat synthesis
 ```
 
-`--stream` starts playback as soon as the first chunk is ready. `--ipa` accepts IPA phonemes directly. `--show-text` prints text tokens in sync with playback.
+`--stream` starts playback as soon as the first chunk is ready. `--ipa` accepts IPA phonemes directly. `--show-text` prints text tokens in sync with playback and cannot be combined with `--output`.
 
 ## performance
 
